@@ -1,183 +1,152 @@
 import sys
-import os
+from pathlib import Path
 
 import streamlit as st
 import pandas as pd
+import matplotlib.pyplot as plt
 
 
-# ---------------------------------------------------------
-# Add src folder to Python path
-# ---------------------------------------------------------
+# ============================================================
+# PATH SETUP
+# ============================================================
 
-SRC_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "src"
-)
+ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
 
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 
-# ---------------------------------------------------------
-# Import FloodSafe modules
-# ---------------------------------------------------------
+# ============================================================
+# IMPORT PROJECT MODULES
+# ============================================================
 
 from data import get_problem_data
-from classical import brute_force_solver, calculate_objective
-from qaoa_solver import run_qaoa
+from classical import brute_force_solver
+from qaoa_solver import solve_qaoa
 
 
-# ---------------------------------------------------------
-# Page configuration
-# ---------------------------------------------------------
+# ============================================================
+# PAGE CONFIG
+# ============================================================
 
 st.set_page_config(
-    page_title="FloodSafe | Quantum Shelter Optimization",
+    page_title="FloodSafe",
     page_icon="🌊",
     layout="wide",
 )
 
 
-# ---------------------------------------------------------
-# Load problem data
-# ---------------------------------------------------------
-
-data = get_problem_data()
-
-sites = data["sites"]
-population = data["population"]
-risk = data["flood_risk"]
-coordinates = data["coordinates"]
-k = data["k"]
-
-
-# ---------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------
-
-def calculate_metrics(selected_sites):
-    """Calculate real-world metrics for selected shelters."""
-
-    population_score = sum(
-        population[i] for i in selected_sites
-    )
-
-    risk_score = sum(
-        risk[i] for i in selected_sites
-    )
-
-    overlap_score = 0.0
-
-    selected_set = set(selected_sites)
-
-    for (i, j), value in data["overlap"].items():
-        if i in selected_set and j in selected_set:
-            overlap_score += value
-
-    objective = calculate_objective(
-        selected_sites,
-        data
-    )
-
-    return (
-        population_score,
-        risk_score,
-        overlap_score,
-        objective,
-    )
-
-
-def create_site_dataframe(selected_sites):
-
-    rows = []
-
-    for i, site in enumerate(sites):
-
-        longitude, latitude = coordinates[site]
-
-        rows.append({
-            "Site": site,
-            "Latitude": latitude,
-            "Longitude": longitude,
-            "Population": population[i],
-            "Flood Risk": risk[i],
-            "Selected": (
-                "Selected"
-                if i in selected_sites
-                else "Candidate"
-            ),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------
-# Header
-# ---------------------------------------------------------
-
-st.title("🌊 FloodSafe")
-
-st.subheader(
-    "Quantum Optimization for Emergency Relief Shelter Placement"
-)
+# ============================================================
+# CUSTOM CSS
+# ============================================================
 
 st.markdown(
     """
-**FloodSafe** uses **Qiskit QAOA** to determine where emergency
-relief shelters should be placed while balancing population coverage,
-flood risk, and redundant coverage.
-"""
+    <style>
+
+    .main-title {
+        font-size: 42px;
+        font-weight: 800;
+        margin-bottom: 5px;
+    }
+
+    .subtitle {
+        font-size: 18px;
+        color: #777;
+        margin-bottom: 25px;
+    }
+
+    .section-title {
+        font-size: 26px;
+        font-weight: 700;
+        margin-top: 25px;
+        margin-bottom: 12px;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.divider()
+
+# ============================================================
+# LOAD PROBLEM
+# ============================================================
+
+@st.cache_data
+def load_problem():
+    return get_problem_data()
 
 
-# ---------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------
+data = load_problem()
 
-st.sidebar.header("Optimization Settings")
 
-depth = st.sidebar.selectbox(
-    "QAOA Depth",
-    [1, 2, 3],
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    '<div class="main-title">🌊 FloodSafe</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    '<div class="subtitle">'
+    'Quantum Optimization for Flood Relief Shelter Placement'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+st.info(
+    "FloodSafe uses QAOA to optimize emergency relief shelter "
+    "placement while balancing population reward, flood risk, "
+    "and redundant coverage."
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header("⚙️ Optimization Settings")
+
+qaoa_depth = st.sidebar.selectbox(
+    "QAOA Depth (p)",
+    options=[1, 2, 3],
     index=0,
 )
 
-st.sidebar.metric(
-    "Candidate Sites",
-    data["num_sites"],
+maxiter = st.sidebar.slider(
+    "Optimizer Iterations",
+    min_value=5,
+    max_value=50,
+    value=15,
+    step=5,
 )
 
-st.sidebar.metric(
-    "Shelters to Select",
-    k,
+shots = st.sidebar.slider(
+    "Sampling Shots",
+    min_value=512,
+    max_value=4096,
+    value=2048,
+    step=512,
 )
 
-st.sidebar.info(
-    "This demonstration uses 12 synthetic "
-    "Kerala-inspired candidate locations."
-)
-
-
-# ---------------------------------------------------------
-# Classical baseline
-# ---------------------------------------------------------
-
-with st.spinner("Calculating classical baseline..."):
-
-    classical_selection, classical_objective, all_results = (
-        brute_force_solver(data)
-    )
-
-classical_population, classical_risk, classical_overlap, _ = (
-    calculate_metrics(classical_selection)
+run_button = st.sidebar.button(
+    "🚀 Run Quantum Optimization",
+    width="stretch",
 )
 
 
-# ---------------------------------------------------------
-# Top metrics
-# ---------------------------------------------------------
+# ============================================================
+# PROBLEM OVERVIEW
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">📌 Problem Overview</div>',
+    unsafe_allow_html=True,
+)
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -190,322 +159,522 @@ with col1:
 with col2:
     st.metric(
         "Shelters Selected",
-        k,
+        data["k"],
     )
 
 with col3:
     st.metric(
-        "Population Coverage",
-        classical_population,
+        "QAOA Depth",
+        qaoa_depth,
     )
 
 with col4:
     st.metric(
-        "Classical Objective",
-        f"{classical_objective:.2f}",
+        "Sampling Shots",
+        shots,
     )
 
 
-# ---------------------------------------------------------
-# Classical baseline
-# ---------------------------------------------------------
+# ============================================================
+# SITE DATA
+# ============================================================
 
-st.header("Classical Baseline")
-
-st.write(
-    "The classical baseline exhaustively evaluates all "
-    f"{len(all_results)} possible 4-site combinations."
+st.markdown(
+    '<div class="section-title">📍 Candidate Relief Sites</div>',
+    unsafe_allow_html=True,
 )
 
-classical_names = [
-    sites[i]
-    for i in classical_selection
-]
+site_rows = []
 
-st.success(
-    "Classical optimal shelters: "
-    + ", ".join(classical_names)
-)
+for i, site in enumerate(data["sites"]):
 
+    site_rows.append(
+        {
+            "ID": i,
+            "Site": site,
+            "Population Score": data["population"][i],
+            "Flood Risk": data["flood_risk"][i],
+        }
+    )
 
-# ---------------------------------------------------------
-# Candidate locations
-# ---------------------------------------------------------
-
-st.header("Candidate Shelter Locations")
-
-map_df = create_site_dataframe(
-    classical_selection
-)
-
-st.map(
-    map_df,
-    latitude="Latitude",
-    longitude="Longitude",
-    size=100,
-)
+site_df = pd.DataFrame(site_rows)
 
 st.dataframe(
-    map_df[
-        [
-            "Site",
-            "Population",
-            "Flood Risk",
-            "Selected",
-        ]
-    ],
-    use_container_width=True,
+    site_df,
+    width="stretch",
     hide_index=True,
 )
 
 
-# ---------------------------------------------------------
-# Quantum optimization
-# ---------------------------------------------------------
+# ============================================================
+# CLASSICAL BASELINE
+# ============================================================
 
-st.divider()
-
-st.header("Quantum Optimization")
-
-st.write(
-    f"Run QAOA with depth **p={depth}** using the "
-    "12-qubit FloodSafe optimization model."
+st.markdown(
+    '<div class="section-title">🖥️ Classical Baseline</div>',
+    unsafe_allow_html=True,
 )
 
-run_button = st.button(
-    "Run QAOA Optimization",
-    type="primary",
-    use_container_width=True,
+classical_result = brute_force_solver(data)
+
+classical_objective = classical_result["objective"]
+
+
+# ------------------------------------------------------------
+# Get classical selected indices robustly
+# ------------------------------------------------------------
+
+classical_indices = (
+    classical_result.get("selected_indices")
+    or classical_result.get("selected")
+    or classical_result.get("sites")
+    or []
 )
 
+
+# ------------------------------------------------------------
+# Convert indices to names
+# ------------------------------------------------------------
+
+classical_sites = []
+
+for item in classical_indices:
+
+    if isinstance(item, int):
+
+        if 0 <= item < len(data["sites"]):
+            classical_sites.append(
+                data["sites"][item]
+            )
+
+    elif isinstance(item, str):
+
+        classical_sites.append(item)
+
+
+st.success(
+    f"Classical optimum objective: "
+    f"**{classical_objective:.2f}**"
+)
+
+if classical_sites:
+
+    st.write(
+        "**Classical optimal shelters:** "
+        + ", ".join(classical_sites)
+    )
+
+else:
+
+    st.write(
+        "**Classical optimal shelters:** "
+        "See optimization result."
+    )
+
+
+# ============================================================
+# QUANTUM OPTIMIZATION
+# ============================================================
 
 if run_button:
 
+    st.markdown(
+        '<div class="section-title">⚛️ QAOA Optimization</div>',
+        unsafe_allow_html=True,
+    )
+
     with st.spinner(
-        f"Running QAOA p={depth}..."
+        f"Running QAOA with p={qaoa_depth}. "
+        "Please wait..."
     ):
 
-        qaoa_result = run_qaoa(
-            data,
-            depth=depth,
-        )
+        try:
 
-    qaoa_selection = qaoa_result["selected_sites"]
+            result = solve_qaoa(
+                data=data,
+                p=qaoa_depth,
+                maxiter=maxiter,
+                shots=shots,
+            )
 
-    qaoa_population, qaoa_risk, qaoa_overlap, qaoa_objective = (
-        calculate_metrics(qaoa_selection)
-    )
+        except Exception as e:
 
-    objective_gap = (
-        qaoa_objective - classical_objective
-    )
+            st.error(
+                "QAOA execution failed."
+            )
 
-    # -----------------------------------------------------
-    # Quantum result
-    # -----------------------------------------------------
+            st.exception(e)
+
+            st.stop()
+
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
 
     st.success(
-        "QAOA optimization completed successfully!"
+        "Quantum optimization completed successfully! 🎉"
     )
 
-    st.header("QAOA Recommendation")
 
-    qaoa_names = [
-        sites[i]
-        for i in qaoa_selection
-    ]
+    # ========================================================
+    # RESULTS
+    # ========================================================
 
-    st.info(
-        "Recommended shelters: "
-        + ", ".join(qaoa_names)
+    st.markdown(
+        '<div class="section-title">🏆 Optimization Results</div>',
+        unsafe_allow_html=True,
     )
 
-    # -----------------------------------------------------
-    # Quantum metrics
-    # -----------------------------------------------------
+    col1, col2, col3, col4 = st.columns(4)
 
-    c1, c2, c3, c4 = st.columns(4)
+    with col1:
 
-    with c1:
-        st.metric(
-            "Population Coverage",
-            qaoa_population,
-        )
-
-    with c2:
-        st.metric(
-            "Flood Risk",
-            qaoa_risk,
-        )
-
-    with c3:
         st.metric(
             "QAOA Objective",
-            f"{qaoa_objective:.2f}",
+            f'{result["objective"]:.2f}',
         )
 
-    with c4:
+    with col2:
+
+        st.metric(
+            "Classical Objective",
+            f'{result["classical_objective"]:.2f}',
+        )
+
+    with col3:
+
         st.metric(
             "Objective Gap",
-            f"{objective_gap:.2f}",
+            f'{result["objective_gap"]:.2f}',
         )
 
-    # -----------------------------------------------------
-    # Quantum vs classical
-    # -----------------------------------------------------
+    with col4:
 
-    st.header("Quantum vs Classical")
+        st.metric(
+            "Feasibility Rate",
+            f'{result["feasibility_rate"] * 100:.2f}%',
+        )
 
-    comparison = pd.DataFrame(
-        {
-            "Method": [
-                "Classical",
-                f"QAOA p={depth}",
-            ],
-            "Objective": [
-                classical_objective,
-                qaoa_objective,
-            ],
-            "Population": [
-                classical_population,
-                qaoa_population,
-            ],
-            "Flood Risk": [
-                classical_risk,
-                qaoa_risk,
-            ],
-        }
+
+    # ========================================================
+    # SELECTED SHELTERS
+    # ========================================================
+
+    st.markdown(
+        '<div class="section-title">'
+        '🚨 Selected Relief Shelters'
+        '</div>',
+        unsafe_allow_html=True,
     )
 
-    st.dataframe(
-        comparison,
-        use_container_width=True,
-        hide_index=True,
-    )
+    selected_sites = result["selected_sites"]
 
-    # -----------------------------------------------------
-    # Result interpretation
-    # -----------------------------------------------------
-
-    if abs(objective_gap) < 1e-9:
+    if selected_sites:
 
         st.success(
-            "QAOA found the same optimal shelter "
-            "placement as the classical exhaustive search."
+            "**QAOA Selected Shelters:** "
+            + ", ".join(selected_sites)
         )
 
     else:
 
         st.warning(
-            f"QAOA produced a feasible solution with an "
-            f"objective gap of {objective_gap:.2f} "
-            "from the classical optimum."
+            "No feasible shelter configuration was found."
         )
 
-    # -----------------------------------------------------
-    # QAOA solution map
-    # -----------------------------------------------------
 
-    st.header("QAOA Shelter Placement")
+    # ========================================================
+    # QUANTUM VS CLASSICAL
+    # ========================================================
 
-    qaoa_map_df = create_site_dataframe(
-        qaoa_selection
+    st.markdown(
+        '<div class="section-title">'
+        '⚖️ Classical vs Quantum'
+        '</div>',
+        unsafe_allow_html=True,
     )
 
-    st.map(
-        qaoa_map_df,
-        latitude="Latitude",
-        longitude="Longitude",
-        size=100,
+    comparison_df = pd.DataFrame(
+        {
+            "Metric": [
+                "Objective",
+                "Objective Gap",
+                "Feasible",
+                "Feasibility Rate",
+            ],
+            "Classical": [
+                classical_objective,
+                0.0,
+                "Yes",
+                "100%",
+            ],
+            "QAOA": [
+                result["objective"],
+                result["objective_gap"],
+                "Yes"
+                if result["feasible"]
+                else "No",
+                f'{result["feasibility_rate"] * 100:.2f}%',
+            ],
+        }
     )
-
-    # -----------------------------------------------------
-    # Selected shelters
-    # -----------------------------------------------------
-
-    st.header("Selected Relief Shelters")
-
-    selected_table = qaoa_map_df[
-        qaoa_map_df["Selected"] == "Selected"
-    ][
-        [
-            "Site",
-            "Population",
-            "Flood Risk",
-        ]
-    ]
 
     st.dataframe(
-        selected_table,
-        use_container_width=True,
+        comparison_df,
+        width="stretch",
         hide_index=True,
     )
 
 
-# ---------------------------------------------------------
-# Methodology
-# ---------------------------------------------------------
-
-st.divider()
-
-with st.expander("How FloodSafe Works"):
+    # ========================================================
+    # OBJECTIVE COMPARISON
+    # ========================================================
 
     st.markdown(
-        """
-### 1. Real-world formulation
+        '<div class="section-title">'
+        '📊 Objective Comparison'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
-Each candidate location is represented by a binary
-decision variable:
+    fig, ax = plt.subplots()
 
-`xᵢ = 1` → select the shelter
+    ax.bar(
+        ["Classical", "QAOA"],
+        [
+            classical_objective,
+            result["objective"],
+        ],
+    )
 
-`xᵢ = 0` → do not select the shelter
+    ax.set_ylabel(
+        "Objective Value"
+    )
 
-### 2. Optimization objective
+    ax.set_title(
+        "Classical vs QAOA Objective"
+    )
 
-FloodSafe balances:
+    st.pyplot(
+        fig,
+        clear_figure=True,
+    )
 
-- Population coverage
-- Flood-risk penalty
-- Redundant coverage penalty
-- Exactly 4 selected shelters
+    plt.close(fig)
 
-### 3. QUBO
 
-The real-world optimization problem is converted
-into a **Quadratic Unconstrained Binary Optimization
-(QUBO)** formulation.
+    # ========================================================
+    # QAOA PARAMETERS
+    # ========================================================
 
-### 4. Ising Hamiltonian
+    st.markdown(
+        '<div class="section-title">'
+        '🧮 Optimized QAOA Parameters'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
-The QUBO is transformed into an Ising cost Hamiltonian
-using:
+    parameter_df = pd.DataFrame(
+        {
+            "Layer": list(
+                range(
+                    1,
+                    len(result["gammas"]) + 1,
+                )
+            ),
+            "Gamma": result["gammas"],
+            "Beta": result["betas"],
+        }
+    )
 
-`xᵢ = (1 - Zᵢ) / 2`
-
-### 5. QAOA
-
-Qiskit is used to construct and optimize the QAOA
-circuit.
-
-The resulting quantum state is sampled to obtain
-candidate shelter placements.
-
-### 6. Classical comparison
-
-The quantum result is compared against exhaustive
-classical search over all 495 possible combinations.
-"""
+    st.dataframe(
+        parameter_df,
+        width="stretch",
+        hide_index=True,
     )
 
 
-# ---------------------------------------------------------
-# Footer
-# ---------------------------------------------------------
+    # ========================================================
+    # BEST BITSTRING
+    # ========================================================
 
-st.divider()
+    st.markdown(
+        '<div class="section-title">'
+        '🔢 Best Quantum Bitstring'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.code(
+        result["best_bitstring"],
+        language="text",
+    )
+
+    st.write(
+        f'Best sample count: '
+        f'**{result["best_sample_count"]}**'
+    )
+
+
+    # ========================================================
+    # FEASIBILITY
+    # ========================================================
+
+    st.markdown(
+        '<div class="section-title">'
+        '✅ Constraint Feasibility'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if result["feasible"]:
+
+        st.success(
+            f'Exactly {data["k"]} shelters were selected. '
+            'The solution satisfies the cardinality constraint.'
+        )
+
+    else:
+
+        st.warning(
+            f'The sampled solution does not satisfy '
+            f'the exactly-{data["k"]} shelter constraint.'
+        )
+
+
+    # ========================================================
+    # QAOA CIRCUIT
+    # ========================================================
+
+    st.markdown(
+        '<div class="section-title">'
+        '🔬 QAOA Circuit'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.expander(
+        "Show Quantum Circuit"
+    ):
+
+        st.text(
+            result["circuit"].draw(
+                output="text"
+            )
+        )
+
+
+    # ========================================================
+    # QUANTUM COUNTS
+    # ========================================================
+
+    st.markdown(
+        '<div class="section-title">'
+        '📈 Sampled Quantum States'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    counts = result["counts"]
+
+    sorted_counts = sorted(
+        counts.items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:15]
+
+    counts_df = pd.DataFrame(
+        sorted_counts,
+        columns=[
+            "Bitstring",
+            "Count",
+        ],
+    )
+
+    st.dataframe(
+        counts_df,
+        width="stretch",
+        hide_index=True,
+    )
+
+
+    # ========================================================
+    # LIMITATIONS
+    # ========================================================
+
+    st.markdown(
+        '<div class="section-title">'
+        '⚠️ Interpretation & Limitations'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.write(
+        """
+        **No quantum advantage is claimed.**
+
+        The classical brute-force solver provides the exact
+        optimum for this small 12-site problem.
+
+        QAOA is evaluated according to how closely its sampled
+        feasible solution approaches the classical optimum.
+
+        The population term is modeled as a reward, while flood
+        risk and redundant coverage are modeled as penalties.
+
+        The exactly-K shelter requirement is encoded through a
+        quadratic penalty in the QUBO formulation.
+
+        The current experiment uses a classical statevector
+        simulator, so these results do not demonstrate
+        fault-tolerant quantum hardware performance.
+        """
+    )
+
+
+else:
+
+    # ========================================================
+    # READY SCREEN
+    # ========================================================
+
+    st.markdown(
+        '<div class="section-title">'
+        '🚀 Ready to Optimize'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.write(
+        """
+        Configure the QAOA parameters in the sidebar and click
+        **Run Quantum Optimization**.
+
+        FloodSafe will:
+
+        1. Build the optimization Hamiltonian.
+        2. Construct the QAOA circuit.
+        3. Optimize the QAOA parameters.
+        4. Sample the final quantum state.
+        5. Find the best feasible shelter configuration.
+        6. Compare it against the exact classical solution.
+        """
+    )
+
+    st.info(
+        "💡 For the fastest demonstration, start with "
+        "p = 1, 15 iterations, and 2048 shots."
+    )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
 
 st.caption(
-    "FloodSafe | Qiskit Fall Fest 2026 | "
-    "Open-Domain Optimization & Real-World Solvers"
+    "FloodSafe • Qiskit Fall Fest 2026 • "
+    "Track 2: Open-Domain Optimization & Real-World Solvers"
 )

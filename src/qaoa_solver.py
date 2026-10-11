@@ -1,4 +1,7 @@
-# FloodSafe - Fast QAOA quantum solver
+# FloodSafe - QAOA Solver
+#
+# Direct statevector implementation of QAOA using Qiskit.
+# Supports p = 1, 2, 3, ... QAOA layers.
 
 import numpy as np
 
@@ -7,465 +10,699 @@ from qiskit.quantum_info import Statevector
 
 from scipy.optimize import minimize
 
-from data import get_problem_data
-from qubo import build_cost_hamiltonian
-from classical import calculate_objective, brute_force_solver
+from src.data import get_problem_data
+from src.qubo import build_cost_hamiltonian
+from src.classical import calculate_objective, brute_force_solver
 
 
-# ---------------------------------------------------------
-# QAOA settings
-# ---------------------------------------------------------
+# ============================================================
+# BITSTRING / SELECTION UTILITIES
+# ============================================================
 
-QAOA_DEPTH = 3
-MAX_ITERATIONS = 30
-SHOTS = 2048
-
-
-# ---------------------------------------------------------
-# Build QAOA circuit
-# ---------------------------------------------------------
-
-def build_qaoa_circuit(cost_hamiltonian, gamma, beta, depth=1):
+def bitstring_to_selection(bitstring, num_sites):
     """
-    Build a QAOA circuit using cost and mixer layers.
+    Convert a Qiskit computational-basis bitstring
+    into selected site indices.
+
+    Qiskit bitstrings are ordered:
+        q_(n-1) ... q_1 q_0
     """
 
-    n = cost_hamiltonian.num_qubits
+    bitstring = bitstring.replace(" ", "")
 
-    qc = QuantumCircuit(n)
+    if len(bitstring) != num_sites:
+        raise ValueError(
+            f"Expected {num_sites}-bit string, got {len(bitstring)}."
+        )
 
-    # Initial |+> state
-    for q in range(n):
+    selected = []
+
+    for q in range(num_sites):
+        # q0 corresponds to the rightmost bit
+        if bitstring[num_sites - 1 - q] == "1":
+            selected.append(q)
+
+    return selected
+
+
+def selection_to_names(selection, data):
+    """Convert selected site indices into site names."""
+
+    return [data["sites"][i] for i in selection]
+
+
+# ============================================================
+# QAOA CIRCUIT
+# ============================================================
+
+def build_qaoa_circuit(
+    hamiltonian,
+    num_qubits,
+    gammas,
+    betas,
+):
+    """
+    Build a p-layer QAOA circuit.
+
+    Hamiltonian:
+        H = sum_j c_j P_j
+
+    Cost unitary:
+        U_C(gamma) = exp(-i gamma H)
+
+    Mixer:
+        U_B(beta) = exp(-i beta sum_i X_i)
+
+    gammas and betas each contain p parameters.
+    """
+
+    p = len(gammas)
+
+    if len(betas) != p:
+        raise ValueError(
+            "gammas and betas must have the same length."
+        )
+
+    qc = QuantumCircuit(num_qubits)
+
+    # --------------------------------------------------------
+    # Uniform initial state |+>
+    # --------------------------------------------------------
+
+    for q in range(num_qubits):
         qc.h(q)
 
+    # --------------------------------------------------------
+    # Convert Hamiltonian to Pauli terms
+    # --------------------------------------------------------
+
+    pauli_terms = hamiltonian.to_list()
+
+    # --------------------------------------------------------
     # QAOA layers
-    for layer in range(depth):
+    # --------------------------------------------------------
 
-        g = gamma[layer]
-        b = beta[layer]
+    for layer in range(p):
 
-        # -------------------------------------------------
-        # Cost layer
-        #
-        # For each Pauli term:
-        #
-        # Z_i      -> RZ
-        # Z_i Z_j  -> RZZ
-        # -------------------------------------------------
+        gamma = gammas[layer]
+        beta = betas[layer]
 
-        for pauli, coefficient in zip(
-            cost_hamiltonian.paulis,
-            cost_hamiltonian.coeffs
-        ):
+        # ====================================================
+        # COST LAYER
+        # ====================================================
 
-            coefficient = float(np.real(coefficient))
+        for label, coefficient in pauli_terms:
 
-            # Ignore identity
-            if pauli.to_label().count("Z") == 0:
+            coeff = float(np.real(coefficient))
+
+            # Identity term contributes only a global phase.
+            if label.count("I") == num_qubits:
                 continue
 
-            z_positions = [
-                i
-                for i, p in enumerate(pauli.to_label()[::-1])
-                if p == "Z"
-            ]
+            z_qubits = []
 
-            if len(z_positions) == 1:
+            # Qiskit Pauli labels are q_(n-1)...q_0
+            for q in range(num_qubits):
+
+                if label[num_qubits - 1 - q] == "Z":
+                    z_qubits.append(q)
+
+            # ------------------------------------------------
+            # Single Z term
+            # ------------------------------------------------
+
+            if len(z_qubits) == 1:
+
+                q = z_qubits[0]
+
+                # RZ(theta) = exp(-i theta Z / 2)
+                #
+                # Need:
+                # exp(-i gamma * coeff * Z)
+                #
+                # Therefore:
+                # theta = 2 * gamma * coeff
 
                 qc.rz(
-                    2 * g * coefficient,
-                    z_positions[0]
+                    2.0 * gamma * coeff,
+                    q,
                 )
 
-            elif len(z_positions) == 2:
+            # ------------------------------------------------
+            # ZZ term
+            # ------------------------------------------------
 
-                i, j = z_positions
+            elif len(z_qubits) == 2:
+
+                q1, q2 = z_qubits
+
+                # RZZ(theta) = exp(-i theta ZZ / 2)
+                #
+                # Therefore:
+                # theta = 2 * gamma * coeff
 
                 qc.rzz(
-                    2 * g * coefficient,
-                    i,
-                    j
+                    2.0 * gamma * coeff,
+                    q1,
+                    q2,
                 )
 
-        # -------------------------------------------------
-        # Mixer layer
-        # -------------------------------------------------
+            else:
 
-        for q in range(n):
+                raise ValueError(
+                    f"Unsupported Pauli term in Hamiltonian: {label}"
+                )
+
+        # ====================================================
+        # MIXER LAYER
+        # ====================================================
+
+        for q in range(num_qubits):
+
+            # RX(theta) = exp(-i theta X / 2)
+            #
+            # Need:
+            # exp(-i beta X)
+            #
+            # Therefore:
+            # theta = 2 * beta
 
             qc.rx(
-                2 * b,
-                q
+                2.0 * beta,
+                q,
             )
 
     return qc
 
 
-# ---------------------------------------------------------
-# Energy calculation
-# ---------------------------------------------------------
+# ============================================================
+# EXPECTATION VALUE
+# ============================================================
 
-def calculate_energy(statevector, hamiltonian):
+def expectation_value(
+    hamiltonian,
+    statevector,
+):
     """
-    Calculate <psi|H|psi>.
+    Calculate:
+
+        <psi|H|psi>
+
+    using matrix-vector multiplication.
     """
 
-    energy = statevector.expectation_value(
-        hamiltonian
+    # Apply H to |psi>
+    evolved = hamiltonian @ statevector
+
+    # Calculate <psi|H|psi>
+    value = np.vdot(
+        statevector,
+        evolved,
     )
 
-    return float(np.real(energy))
+    return float(np.real(value))
 
 
-# ---------------------------------------------------------
-# QAOA optimization
-# ---------------------------------------------------------
+# ============================================================
+# QAOA OPTIMIZATION
+# ============================================================
 
-def run_qaoa(data, depth=QAOA_DEPTH):
+def optimize_qaoa(
+    hamiltonian,
+    num_qubits,
+    p=1,
+    maxiter=30,
+):
+    """
+    Optimize QAOA parameters using a classical optimizer.
 
-    hamiltonian, _, _, _ = build_cost_hamiltonian(data)
+    Parameters
+    ----------
+    hamiltonian :
+        Ising Hamiltonian.
 
-    n = hamiltonian.num_qubits
+    num_qubits :
+        Number of qubits.
 
-    print()
-    print("=" * 60)
-    print("FloodSafe - QAOA Solver")
-    print("=" * 60)
+    p : int
+        Number of QAOA layers.
 
-    print()
-    print("Qubits:", n)
-    print("QAOA depth:", depth)
-    print("Maximum iterations:", MAX_ITERATIONS)
-    print("Shots:", SHOTS)
+    maxiter : int
+        Maximum number of classical optimization iterations.
+    """
 
-    # -----------------------------------------------------
-    # Objective history
-    # -----------------------------------------------------
-
-    objective_history = []
-
-    # -----------------------------------------------------
-    # QAOA objective function
-    # -----------------------------------------------------
-
-    def objective(parameters):
-
-        gamma = parameters[:depth]
-        beta = parameters[depth:]
-
-        circuit = build_qaoa_circuit(
-            hamiltonian,
-            gamma,
-            beta,
-            depth
+    if p < 1:
+        raise ValueError(
+            "QAOA depth p must be at least 1."
         )
 
-        statevector = Statevector.from_instruction(
-            circuit
-        )
-
-        energy = calculate_energy(
-            statevector,
-            hamiltonian
-        )
-
-        objective_history.append(energy)
-
-        return energy
-
-    # -----------------------------------------------------
-    # Initial parameters
-    # -----------------------------------------------------
-
-    np.random.seed(42)
-
-    initial_parameters = np.random.uniform(
-        0,
-        np.pi,
-        2 * depth
-    )
-
-    print()
-    print("Number of QAOA parameters:",
-          len(initial_parameters))
-
-    print()
-    print("Starting QAOA optimization...")
-
-    # -----------------------------------------------------
-    # Classical optimizer
-    # -----------------------------------------------------
-
-    result = minimize(
-        objective,
-        initial_parameters,
-        method="COBYLA",
-        options={
-            "maxiter": MAX_ITERATIONS
-        }
-    )
-
-    print()
-    print("Optimization finished.")
-
-    print("Iterations:",
-          result.nfev)
-
-    print("Minimum expected energy:",
-          round(float(result.fun), 6))
-
-    print()
-    print("Optimal parameters:")
-
-    print(
-        np.round(result.x, 5)
-    )
-
-    # -----------------------------------------------------
-    # Build optimized circuit
-    # -----------------------------------------------------
-
-    gamma = result.x[:depth]
-    beta = result.x[depth:]
-
-    optimized_circuit = build_qaoa_circuit(
-        hamiltonian,
-        gamma,
-        beta,
-        depth
-    )
-
-    optimized_statevector = Statevector.from_instruction(
-        optimized_circuit
-    )
-
-    # -----------------------------------------------------
-    # Get computational-basis probabilities
-    # -----------------------------------------------------
-
-    probabilities = optimized_statevector.probabilities()
-
-    # -----------------------------------------------------
-    # Sample bitstrings
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Reproducible initial parameters
+    # --------------------------------------------------------
 
     rng = np.random.default_rng(42)
 
-    states = np.arange(
-        2 ** n
+    initial_gammas = rng.uniform(
+        0.1,
+        0.8,
+        size=p,
     )
 
-    sampled_states = rng.choice(
-        states,
-        size=SHOTS,
-        p=probabilities
+    initial_betas = rng.uniform(
+        0.1,
+        0.8,
+        size=p,
     )
 
-    # Count samples
-    counts = {}
+    initial_params = np.concatenate(
+        [
+            initial_gammas,
+            initial_betas,
+        ]
+    )
 
-    for state in sampled_states:
+    # --------------------------------------------------------
+    # Objective function for classical optimizer
+    # --------------------------------------------------------
 
-        bitstring = format(
+    def objective(params):
+
+        gammas = params[:p]
+        betas = params[p:]
+
+        circuit = build_qaoa_circuit(
+            hamiltonian,
+            num_qubits,
+            gammas,
+            betas,
+        )
+
+        state = Statevector.from_instruction(
+            circuit
+        )
+
+        return expectation_value(
+            hamiltonian,
             state,
-            f"0{n}b"
         )
 
-        counts[bitstring] = (
-            counts.get(bitstring, 0) + 1
-        )
+    # --------------------------------------------------------
+    # Classical optimization
+    # --------------------------------------------------------
 
-    # -----------------------------------------------------
-    # Evaluate sampled solutions
-    # -----------------------------------------------------
-
-    scored = []
-
-    for key, count in counts.items():
-
-        # Qiskit little-endian convention
-        bits = key[::-1]
-
-        assignment = [
-            int(bits[i])
-            for i in range(n)
-        ]
-
-        selected_sites = [
-            i
-            for i, bit in enumerate(assignment)
-            if bit == 1
-        ]
-
-        objective_value = calculate_objective(
-            selected_sites,
-            data
-        )
-
-        feasible = (
-            len(selected_sites) == data["k"]
-        )
-
-        scored.append(
-            (
-                assignment,
-                count,
-                objective_value,
-                feasible
-            )
-        )
-
-    # -----------------------------------------------------
-    # Only consider feasible solutions
-    # -----------------------------------------------------
-
-    feasible_results = [
-        item
-        for item in scored
-        if item[3]
-    ]
-
-    if feasible_results:
-
-        best = min(
-            feasible_results,
-            key=lambda x: x[2]
-        )
-
-    else:
-
-        best = min(
-            scored,
-            key=lambda x: abs(
-                sum(x[0]) - data["k"]
-            )
-        )
-
-    best_assignment = best[0]
-    best_count = best[1]
-    best_objective = best[2]
-    best_feasible = best[3]
-
-    selected_sites = [
-        i
-        for i, bit in enumerate(best_assignment)
-        if bit == 1
-    ]
-
-    # -----------------------------------------------------
-    # Feasibility rate
-    # -----------------------------------------------------
-
-    total_shots = sum(
-        count
-        for _, count, _, _ in scored
+    result = minimize(
+        objective,
+        initial_params,
+        method="COBYLA",
+        options={
+            "maxiter": maxiter,
+            "rhobeg": 0.5,
+        },
     )
 
-    feasible_shots = sum(
-        count
-        for _, count, _, feasible in scored
-        if feasible
+    # --------------------------------------------------------
+    # Optimized parameters
+    # --------------------------------------------------------
+
+    optimized_params = result.x
+
+    gammas = optimized_params[:p]
+    betas = optimized_params[p:]
+
+    # --------------------------------------------------------
+    # Build final optimized circuit
+    # --------------------------------------------------------
+
+    final_circuit = build_qaoa_circuit(
+        hamiltonian,
+        num_qubits,
+        gammas,
+        betas,
     )
 
-    feasibility_rate = (
-        feasible_shots / total_shots
+    # --------------------------------------------------------
+    # Final statevector
+    # --------------------------------------------------------
+
+    final_state = Statevector.from_instruction(
+        final_circuit
     )
 
-    # -----------------------------------------------------
-    # Classical optimum
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Final expectation value
+    # --------------------------------------------------------
 
-    classical_selection, classical_objective, _ = (
-        brute_force_solver(data)
+    final_energy = expectation_value(
+        hamiltonian,
+        final_state,
     )
-
-    # -----------------------------------------------------
-    # Objective comparison
-    # -----------------------------------------------------
-
-    objective_gap = (
-        best_objective -
-        classical_objective
-    )
-
-    # -----------------------------------------------------
-    # Results
-    # -----------------------------------------------------
-
-    print()
-    print("=" * 60)
-    print("QAOA RESULTS")
-    print("=" * 60)
-
-    print()
-    print("Best QAOA assignment:")
-    print(best_assignment)
-
-    print()
-    print("Selected shelter locations:")
-
-    for index in selected_sites:
-
-        print(
-            f"  {index}: {data['sites'][index]}"
-        )
-
-    print()
-    print("Number of selected shelters:",
-          len(selected_sites))
-
-    print()
-    print("QAOA objective:",
-          round(best_objective, 3))
-
-    print("Classical optimal objective:",
-          round(classical_objective, 3))
-
-    print("Objective gap:",
-          round(objective_gap, 3))
-
-    print()
-    print("Feasible solution:",
-          best_feasible)
-
-    print(
-        "Feasibility rate:",
-        f"{feasibility_rate * 100:.2f}%"
-    )
-
-    print()
-    print("Best solution sample count:",
-          best_count)
-
-    print()
-    print("=" * 60)
-    print("FloodSafe QAOA completed!")
-    print("=" * 60)
 
     return {
-        "assignment": best_assignment,
-        "selected_sites": selected_sites,
-        "objective": best_objective,
-        "classical_selection": classical_selection,
-        "classical_objective": classical_objective,
-        "objective_gap": objective_gap,
-        "feasibility_rate": feasibility_rate,
-        "counts": counts,
-        "objective_history": objective_history,
-        "optimal_parameters": result.x,
-        "circuit": optimized_circuit,
+        "gammas": gammas,
+        "betas": betas,
+        "energy": final_energy,
+        "statevector": final_state,
+        "circuit": final_circuit,
+        "optimizer_result": result,
     }
 
 
-# ---------------------------------------------------------
-# Main
-# ---------------------------------------------------------
+# ============================================================
+# SAMPLING
+# ============================================================
+
+def sample_statevector(
+    statevector,
+    shots=2048,
+    seed=42,
+):
+    """
+    Sample computational-basis states from a Statevector.
+    """
+
+    probabilities = statevector.probabilities()
+
+    rng = np.random.default_rng(seed)
+
+    states = np.arange(
+        len(probabilities)
+    )
+
+    samples = rng.choice(
+        states,
+        size=shots,
+        p=probabilities,
+    )
+
+    counts = {}
+
+    num_qubits = statevector.num_qubits
+
+    for state in samples:
+
+        bitstring = format(
+            int(state),
+            f"0{num_qubits}b",
+        )
+
+        counts[bitstring] = (
+            counts.get(
+                bitstring,
+                0,
+            )
+            + 1
+        )
+
+    return counts
+
+
+# ============================================================
+# MAIN QAOA SOLVER
+# ============================================================
+
+def solve_qaoa(
+    data=None,
+    p=1,
+    maxiter=30,
+    shots=2048,
+):
+    """
+    Solve the FloodSafe shelter placement problem using QAOA.
+
+    Supports arbitrary QAOA depth p >= 1.
+    """
+
+    # --------------------------------------------------------
+    # Load problem data
+    # --------------------------------------------------------
+
+    if data is None:
+        data = get_problem_data()
+
+    # --------------------------------------------------------
+    # Build Ising Hamiltonian
+    # --------------------------------------------------------
+
+    hamiltonian, pieces = build_cost_hamiltonian(
+        data
+    )
+
+    num_qubits = data["num_sites"]
+
+    # --------------------------------------------------------
+    # Classical exact baseline
+    # --------------------------------------------------------
+
+    classical = brute_force_solver(
+        data
+    )
+
+    # --------------------------------------------------------
+    # Optimize QAOA
+    # --------------------------------------------------------
+
+    optimization_result = optimize_qaoa(
+        hamiltonian,
+        num_qubits,
+        p=p,
+        maxiter=maxiter,
+    )
+
+    statevector = optimization_result[
+        "statevector"
+    ]
+
+    # --------------------------------------------------------
+    # Sample final quantum state
+    # --------------------------------------------------------
+
+    counts = sample_statevector(
+        statevector,
+        shots=shots,
+        seed=42,
+    )
+
+    # ========================================================
+    # FIND BEST FEASIBLE SAMPLED SOLUTION
+    # ========================================================
+
+    best_solution = None
+
+    feasible_count = 0
+
+    for bitstring, count in counts.items():
+
+        selected = bitstring_to_selection(
+            bitstring,
+            num_qubits,
+        )
+
+        # ----------------------------------------------------
+        # Exact-K feasibility
+        # ----------------------------------------------------
+
+        if len(selected) == data["k"]:
+
+            feasible_count += count
+
+            objective = calculate_objective(
+                selected,
+                data,
+            )
+
+            if (
+                best_solution is None
+                or objective
+                < best_solution["objective"]
+            ):
+
+                best_solution = {
+                    "bitstring": bitstring,
+                    "selected": selected,
+                    "objective": objective,
+                    "count": count,
+                }
+
+    # ========================================================
+    # HANDLE CASE WHERE NO FEASIBLE SAMPLE APPEARED
+    # ========================================================
+
+    if best_solution is None:
+
+        most_frequent = max(
+            counts.items(),
+            key=lambda x: x[1],
+        )
+
+        bitstring = most_frequent[0]
+
+        selected = bitstring_to_selection(
+            bitstring,
+            num_qubits,
+        )
+
+        objective = calculate_objective(
+            selected,
+            data,
+        )
+
+        best_solution = {
+            "bitstring": bitstring,
+            "selected": selected,
+            "objective": objective,
+            "count": most_frequent[1],
+        }
+
+    # ========================================================
+    # METRICS
+    # ========================================================
+
+    qaoa_objective = (
+        best_solution["objective"]
+    )
+
+    classical_objective = (
+        classical["objective"]
+    )
+
+    objective_gap = (
+        qaoa_objective
+        - classical_objective
+    )
+
+    feasibility_rate = (
+        feasible_count / shots
+    )
+
+    feasible = (
+        len(best_solution["selected"])
+        == data["k"]
+    )
+
+    selected_names = selection_to_names(
+        best_solution["selected"],
+        data,
+    )
+
+    # ========================================================
+    # RETURN COMPLETE RESULT
+    # ========================================================
+
+    return {
+        "selected_sites": selected_names,
+
+        "selected_indices": (
+            best_solution["selected"]
+        ),
+
+        "objective": qaoa_objective,
+
+        "classical_objective": (
+            classical_objective
+        ),
+
+        "objective_gap": objective_gap,
+
+        "feasible": feasible,
+
+        "feasibility_rate": (
+            feasibility_rate
+        ),
+
+        "best_bitstring": (
+            best_solution["bitstring"]
+        ),
+
+        "best_sample_count": (
+            best_solution["count"]
+        ),
+
+        "counts": counts,
+
+        "gammas": (
+            optimization_result["gammas"]
+        ),
+
+        "betas": (
+            optimization_result["betas"]
+        ),
+
+        "energy": (
+            optimization_result["energy"]
+        ),
+
+        "circuit": (
+            optimization_result["circuit"]
+        ),
+
+        "statevector": (
+            optimization_result["statevector"]
+        ),
+
+        "p": p,
+
+        "shots": shots,
+
+        "maxiter": maxiter,
+
+        "classical_solution": classical,
+
+        "hamiltonian": hamiltonian,
+
+        "qubo_pieces": pieces,
+    }
+
+
+# ============================================================
+# TEST FROM TERMINAL
+# ============================================================
 
 if __name__ == "__main__":
 
     data = get_problem_data()
 
-    run_qaoa(
+    print("FloodSafe QAOA Solver")
+    print("====================")
+    print()
+
+    result = solve_qaoa(
         data,
-        depth=QAOA_DEPTH
+        p=1,
+        maxiter=30,
+        shots=2048,
+    )
+
+    print(
+        "QAOA depth:",
+        result["p"],
+    )
+
+    print(
+        "Selected shelters:",
+        result["selected_sites"],
+    )
+
+    print(
+        "QAOA objective:",
+        result["objective"],
+    )
+
+    print(
+        "Classical optimal objective:",
+        result["classical_objective"],
+    )
+
+    print(
+        "Objective gap:",
+        result["objective_gap"],
+    )
+
+    print(
+        "Feasible:",
+        result["feasible"],
+    )
+
+    print(
+        "Feasibility rate:",
+        result["feasibility_rate"],
     )

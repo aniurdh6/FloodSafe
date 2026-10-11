@@ -1,44 +1,40 @@
 # FloodSafe - QUBO and Ising Hamiltonian construction
 
-from data import get_problem_data
-
+from src.data import get_problem_data
 from qiskit.quantum_info import SparsePauliOp
 
 
-# ---------------------------------------------------------
-# QUBO weights
-# ---------------------------------------------------------
+# ============================================================
+# QUBO WEIGHTS
+# ============================================================
 
 POPULATION_WEIGHT = 1.0
 RISK_WEIGHT = 0.35
 OVERLAP_WEIGHT = 12.0
 
-# Penalty for violating the exactly-K constraint
+# Penalty for selecting something other than exactly K shelters
 CONSTRAINT_PENALTY = 50.0
 
 
-# ---------------------------------------------------------
-# Build QUBO
-# ---------------------------------------------------------
+# ============================================================
+# BUILD QUBO
+# ============================================================
 
-def build_qubo(data):
+def build_qubo(data=None):
     """
     Build the FloodSafe QUBO.
 
-    The optimization problem is:
-
-        minimize:
-            - population reward
-            + flood-risk penalty
-            + overlap penalty
-            + exactly-K penalty
+    Objective:
+        - maximize population coverage
+        + minimize flood risk
+        + minimize redundant coverage
 
     Constraint:
-
-        sum(x_i) = K
-
-    where x_i is binary.
+        select exactly K shelters.
     """
+
+    if data is None:
+        data = get_problem_data()
 
     n = data["num_sites"]
     k = data["k"]
@@ -48,233 +44,243 @@ def build_qubo(data):
     overlap = data["overlap"]
 
     # Linear coefficients
-    linear = [0.0] * n
-
-    # Quadratic coefficients
-    quadratic = {}
-
-    # Constant term
-    constant = CONSTRAINT_PENALTY * (k ** 2)
-
-    # -----------------------------------------------------
-    # Population + risk
-    # -----------------------------------------------------
+    linear = {}
 
     for i in range(n):
 
-        linear[i] += (
+        linear[i] = (
             -POPULATION_WEIGHT * population[i]
             + RISK_WEIGHT * flood_risk[i]
         )
 
-    # -----------------------------------------------------
-    # Overlap penalty
-    # -----------------------------------------------------
+    # Quadratic coefficients
+    quadratic = {}
 
+    # Overlap penalty
     for (i, j), value in overlap.items():
 
         quadratic[(i, j)] = (
             OVERLAP_WEIGHT * value
         )
 
-    # -----------------------------------------------------
-    # Exactly-K constraint
+    # ========================================================
+    # EXACT-K CONSTRAINT
     #
     # A(sum(x_i) - K)^2
     #
     # = A sum(x_i)
     #   + 2A sum(x_i x_j)
-    #   - 2AK sum(x_i)
+    #   - 2AK
     #   + AK^2
-    #
-    # Since x_i^2 = x_i:
-    #
-    # Linear contribution:
-    #       A - 2AK
-    #
-    # Quadratic contribution:
-    #       2A
-    # -----------------------------------------------------
+    # ========================================================
 
+    A = CONSTRAINT_PENALTY
+
+    # Linear contribution
     for i in range(n):
+        linear[i] += A - 2 * A * k
 
-        linear[i] += (
-            CONSTRAINT_PENALTY
-            - 2 * CONSTRAINT_PENALTY * k
-        )
-
+    # Quadratic contribution
     for i in range(n):
         for j in range(i + 1, n):
 
             if (i, j) in quadratic:
-                quadratic[(i, j)] += (
-                    2 * CONSTRAINT_PENALTY
-                )
+                quadratic[(i, j)] += 2 * A
             else:
-                quadratic[(i, j)] = (
-                    2 * CONSTRAINT_PENALTY
-                )
+                quadratic[(i, j)] = 2 * A
 
-    return constant, linear, quadratic
+    # Constant contribution
+    constant = A * (k ** 2)
+
+    return {
+        "linear": linear,
+        "quadratic": quadratic,
+        "constant": constant,
+    }
 
 
-# ---------------------------------------------------------
-# Convert QUBO to Ising Hamiltonian
-# ---------------------------------------------------------
+# ============================================================
+# QUBO -> ISING
+# ============================================================
 
-def qubo_to_ising(constant, linear, quadratic):
+def qubo_to_ising(qubo):
     """
-    Convert:
+    Convert QUBO into an Ising Hamiltonian.
 
-        C(x) = c + sum(a_i x_i)
-                  + sum(b_ij x_i x_j)
-
-    into an Ising Hamiltonian using:
+    Uses:
 
         x_i = (1 - Z_i) / 2
     """
 
-    n = len(linear)
+    linear = qubo["linear"]
+    quadratic = qubo["quadratic"]
+    constant = qubo["constant"]
 
-    # Identity contribution
-    identity = constant
+    num_qubits = len(linear)
+
+    # Identity coefficient
+    identity_coefficient = float(constant)
 
     # Z coefficients
-    z_coefficients = [0.0] * n
+    z_coefficients = {
+        i: 0.0
+        for i in range(num_qubits)
+    }
 
-    # -----------------------------------------------------
+    # ZZ coefficients
+    zz_coefficients = {}
+
+    # --------------------------------------------------------
     # Linear terms
-    # -----------------------------------------------------
+    #
+    # a_i x_i
+    #
+    # = a_i/2 - a_i/2 Z_i
+    # --------------------------------------------------------
 
-    for i in range(n):
+    for i, coefficient in linear.items():
 
-        a = linear[i]
+        coefficient = float(coefficient)
 
-        identity += a / 2.0
-        z_coefficients[i] -= a / 2.0
+        identity_coefficient += coefficient / 2.0
 
-    # -----------------------------------------------------
+        z_coefficients[i] += -coefficient / 2.0
+
+    # --------------------------------------------------------
     # Quadratic terms
-    # -----------------------------------------------------
+    #
+    # b_ij x_i x_j
+    #
+    # = b_ij/4
+    #   - b_ij/4 Z_i
+    #   - b_ij/4 Z_j
+    #   + b_ij/4 Z_i Z_j
+    # --------------------------------------------------------
 
-    zz_terms = []
+    for (i, j), coefficient in quadratic.items():
 
-    for (i, j), b in quadratic.items():
+        coefficient = float(coefficient)
 
-        identity += b / 4.0
+        identity_coefficient += coefficient / 4.0
 
-        z_coefficients[i] -= b / 4.0
-        z_coefficients[j] -= b / 4.0
+        z_coefficients[i] += -coefficient / 4.0
+        z_coefficients[j] += -coefficient / 4.0
 
-        zz_terms.append((i, j, b / 4.0))
+        zz_coefficients[(i, j)] = (
+            zz_coefficients.get((i, j), 0.0)
+            + coefficient / 4.0
+        )
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # Build SparsePauliOp
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
-    terms = []
+    paulis = []
+    coefficients = []
 
-    # Identity term
-    if abs(identity) > 1e-12:
-        terms.append(("I" * n, identity))
+    # Identity
+    paulis.append("I" * num_qubits)
+    coefficients.append(identity_coefficient)
 
     # Z terms
-    for i, coefficient in enumerate(z_coefficients):
+    for i in range(num_qubits):
+
+        coefficient = z_coefficients[i]
 
         if abs(coefficient) > 1e-12:
 
-            pauli = ["I"] * n
-            pauli[i] = "Z"
+            label = ["I"] * num_qubits
 
-            # Qiskit uses little-endian Pauli strings
-            pauli_string = "".join(reversed(pauli))
+            # Qiskit Pauli labels are ordered q(n-1)...q0
+            label[num_qubits - 1 - i] = "Z"
 
-            terms.append(
-                (pauli_string, coefficient)
-            )
+            paulis.append("".join(label))
+            coefficients.append(coefficient)
 
     # ZZ terms
-    for i, j, coefficient in zz_terms:
+    for (i, j), coefficient in zz_coefficients.items():
 
-        pauli = ["I"] * n
+        if abs(coefficient) <= 1e-12:
+            continue
 
-        pauli[i] = "Z"
-        pauli[j] = "Z"
+        label = ["I"] * num_qubits
 
-        pauli_string = "".join(reversed(pauli))
+        label[num_qubits - 1 - i] = "Z"
+        label[num_qubits - 1 - j] = "Z"
 
-        terms.append(
-            (pauli_string, coefficient)
-        )
+        paulis.append("".join(label))
+        coefficients.append(coefficient)
 
-    return SparsePauliOp.from_list(terms)
+    hamiltonian = SparsePauliOp(
+        paulis,
+        coeffs=coefficients
+    )
+
+    return hamiltonian
 
 
-# ---------------------------------------------------------
-# Complete Hamiltonian builder
-# ---------------------------------------------------------
+# ============================================================
+# COMPLETE COST HAMILTONIAN
+# ============================================================
 
-def build_cost_hamiltonian(data):
+def build_cost_hamiltonian(data=None):
+    """
+    Build the FloodSafe QUBO and corresponding
+    Ising cost Hamiltonian.
+    """
 
-    constant, linear, quadratic = build_qubo(data)
+    if data is None:
+        data = get_problem_data()
+
+    qubo = build_qubo(data)
 
     hamiltonian = qubo_to_ising(
-        constant,
-        linear,
-        quadratic
+        qubo
     )
 
-    return (
-        hamiltonian,
-        constant,
-        linear,
-        quadratic
-    )
+    return hamiltonian, qubo
 
 
-# ---------------------------------------------------------
-# Test
-# ---------------------------------------------------------
+# ============================================================
+# MAIN TEST
+# ============================================================
 
 if __name__ == "__main__":
 
     data = get_problem_data()
 
-    hamiltonian, constant, linear, quadratic = (
-        build_cost_hamiltonian(data)
+    hamiltonian, qubo = build_cost_hamiltonian(
+        data
     )
 
     print()
-    print("=" * 60)
-    print("FloodSafe - QUBO Construction")
-    print("=" * 60)
-
-    print()
-    print("Number of variables:", data["num_sites"])
-    print("Required shelters:", data["k"])
-
-    print()
-    print("Constraint penalty:", CONSTRAINT_PENALTY)
-
-    print()
-    print("QUBO constant:")
-    print(constant)
-
-    print()
-    print("Number of linear terms:")
-    print(len(linear))
-
-    print()
-    print("Number of quadratic terms:")
-    print(len(quadratic))
-
-    print()
-    print("Ising Hamiltonian:")
-    print(hamiltonian)
-
-    print()
-    print("Number of qubits:")
-    print(hamiltonian.num_qubits)
-
-    print()
-    print("FloodSafe QUBO construction completed!")
+    print("FloodSafe QUBO")
+    print("==============")
+    print(
+        "Number of variables:",
+        data["num_sites"]
+    )
+    print(
+        "Number of shelters (K):",
+        data["k"]
+    )
+    print(
+        "Constraint penalty:",
+        CONSTRAINT_PENALTY
+    )
+    print(
+        "QUBO constant:",
+        qubo["constant"]
+    )
+    print(
+        "Linear terms:",
+        len(qubo["linear"])
+    )
+    print(
+        "Quadratic terms:",
+        len(qubo["quadratic"])
+    )
+    print(
+        "Number of qubits:",
+        hamiltonian.num_qubits
+    )
